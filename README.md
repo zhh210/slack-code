@@ -99,7 +99,7 @@ SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 CLAUDE_WORKING_DIR=/path/to/your/project
 
-# Optional: custom database location (default: ~/.slack_connect/conversations.db)
+# Optional: custom database location (default: ~/.slack_code/conversations.db)
 SLACK_CONV_DB=/path/to/conversations.db
 ```
 
@@ -185,7 +185,7 @@ Set the `SLACK_CONV_DB` environment variable:
 export SLACK_CONV_DB=/path/to/conversations.db
 ```
 
-Default location: `~/.slack_connect/conversations.db`
+Default location: `~/.slack_code/conversations.db`
 
 ### Adjust Response Length
 

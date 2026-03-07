@@ -7,6 +7,8 @@ Mention the bot or DM it to start a conversation.
 
 import os
 import asyncio
+import atexit
+import threading
 import tempfile
 import requests
 from pathlib import Path
@@ -16,6 +18,28 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from claude_handler import ClaudeCodeHandler, ClaudeResponse
+
+_bot_user_id: Optional[str] = None
+
+# --- Persistent async event loop running in a background thread ---
+# ClaudeSDKClient instances are long-lived and tied to an event loop.
+# Slack Bolt handlers are synchronous, so we maintain a dedicated loop.
+_loop = asyncio.new_event_loop()
+_loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
+_loop_thread.start()
+
+
+def run_async(coro):
+    """Run an async coroutine on the persistent event loop and wait for the result."""
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result()
+
+
+def get_bot_user_id(client) -> str:
+    """Get the bot's user ID, caching after first lookup."""
+    global _bot_user_id
+    if _bot_user_id is None:
+        _bot_user_id = client.auth_test()["user_id"]
+    return _bot_user_id
 
 
 def download_slack_file(file_info: dict, bot_token: str, dest_dir: Path) -> Optional[Path]:
@@ -46,7 +70,7 @@ def get_slack_context(client, channel: str, thread_ts: Optional[str], current_ts
     Returns formatted context string.
     """
     messages = []
-    bot_user_id = client.auth_test().get("user_id")
+    bot_user_id = get_bot_user_id(client)
 
     try:
         if thread_ts and thread_ts != current_ts:
@@ -109,27 +133,29 @@ load_dotenv()
 # Initialize Slack app
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
-# Get database path from env or use default
-default_db_dir = Path.home() / ".slack_connect"
-default_db_path = default_db_dir / "conversations.db"
-db_path = os.environ.get("SLACK_CONV_DB", str(default_db_path))
-
-# Ensure database directory exists
-Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-
 # Initialize Claude Code handler
 claude_handler = ClaudeCodeHandler(
     working_dir=os.environ.get("CLAUDE_WORKING_DIR", os.getcwd()),
-    db_path=db_path,
+    slack_user_token=os.environ.get("SLACK_USER_TOKEN"),
 )
-
-# Store conversation contexts per channel/thread
-conversations: dict[str, list[dict]] = {}
 
 
 def get_conversation_key(channel: str, thread_ts: Optional[str] = None) -> str:
     """Generate a unique key for each conversation thread."""
     return f"{channel}:{thread_ts or 'main'}"
+
+
+async def _periodic_cleanup():
+    """Periodically clean up idle ClaudeSDKClient instances."""
+    while True:
+        await asyncio.sleep(300)  # Check every 5 minutes
+        try:
+            await claude_handler.cleanup_idle_clients()
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+
+# Schedule the periodic cleanup on the persistent loop
+asyncio.run_coroutine_threadsafe(_periodic_cleanup(), _loop)
 
 
 @app.event("app_mention")
@@ -141,7 +167,7 @@ def handle_mention(event, say, client):
     text = event["text"]
 
     # Remove the bot mention from the text
-    bot_user_id = client.auth_test()["user_id"]
+    bot_user_id = get_bot_user_id(client)
     prompt = text.replace(f"<@{bot_user_id}>", "").strip()
 
     if not prompt:
@@ -165,7 +191,7 @@ def handle_mention(event, say, client):
 
     # Process with Claude Code
     try:
-        result = asyncio.run(claude_handler.process_message(
+        result = run_async(claude_handler.process_message(
             prompt=prompt,
             conversation_key=get_conversation_key(channel, thread_ts),
             output_dir=output_dir,
@@ -277,7 +303,7 @@ def handle_dm(event, say, client):
 
     # Process with Claude Code
     try:
-        result = asyncio.run(claude_handler.process_message(
+        result = run_async(claude_handler.process_message(
             prompt=prompt,
             conversation_key=get_conversation_key(channel, thread_ts),
             image_paths=image_paths,
@@ -371,9 +397,7 @@ def handle_reaction_delete(event, client):
 
         message = messages[0]
 
-        # Get bot's user ID
-        auth_result = client.auth_test()
-        bot_user_id = auth_result.get("user_id")
+        bot_user_id = get_bot_user_id(client)
 
         # Only delete if it's a bot message
         if message.get("user") == bot_user_id or message.get("bot_id"):
@@ -398,11 +422,11 @@ def handle_slash_command(ack, respond, command):
     respond(":thinking_face: Processing your request...")
 
     try:
-        result = asyncio.run(claude_handler.process_message(
+        result = run_async(claude_handler.process_message(
             prompt=prompt,
             conversation_key=get_conversation_key(channel, "slash")
         ))
-        respond(result)
+        respond(result.text)
     except Exception as e:
         respond(f":x: Error: {str(e)}")
 
@@ -412,19 +436,17 @@ def handle_reset_command(ack, respond, command):
     """Reset conversation context for the current channel."""
     ack()
     channel = command["channel_id"]
-
-    # Clear all conversations for this channel
-    keys_to_remove = [k for k in conversations if k.startswith(f"{channel}:")]
-    for key in keys_to_remove:
-        del conversations[key]
-
-    claude_handler.reset_conversation(get_conversation_key(channel, "slash"))
+    run_async(claude_handler.reset_conversation(get_conversation_key(channel, "slash")))
     respond(":white_check_mark: Conversation context has been reset.")
 
 
 def main():
     """Start the Slack bot."""
     print("Starting Claude Code Slack Bot...")
+
+    # Clean up clients on shutdown
+    atexit.register(lambda: run_async(claude_handler.close()))
+
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
 

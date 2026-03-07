@@ -9,7 +9,8 @@ A Slack bot powered by the [Claude Agent SDK](https://github.com/anthropics/clau
 - **Slash commands**: Use `/claude` for quick queries
 - **Image support**: Share images for Claude to analyze
 - **File creation**: Claude can create and send files back to you
-- **Persistent history**: Conversation history saved to SQLite database
+- **Cross-channel search**: Search and read messages from any public channel (with user token)
+- **Persistent sessions**: Conversation context maintained via `ClaudeSDKClient` — no database needed
 - **Delete messages**: React with :x: to delete bot messages
 
 ## Prerequisites
@@ -21,9 +22,8 @@ A Slack bot powered by the [Claude Agent SDK](https://github.com/anthropics/clau
 ## Project Structure
 
 ```
-├── bot.py              # Main Slack bot
-├── claude_handler.py   # Claude Code SDK integration
-├── conversation_db.py  # SQLite conversation storage
+├── bot.py              # Main Slack bot (event handlers, async loop)
+├── claude_handler.py   # ClaudeSDKClient integration + Slack tools
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Environment template
 └── README.md
@@ -52,6 +52,16 @@ im:read              - Access DM info
 im:write             - Send DMs
 commands             - Use slash commands
 reactions:read       - Read reactions (for message deletion)
+```
+
+#### Optional: User Token Scopes (for cross-channel search)
+
+To enable Claude to search and read messages across public channels, add these **User Token Scopes**:
+
+```
+search:read          - Search messages across workspace
+channels:history     - Read public channel messages
+channels:read        - List public channels
 ```
 
 ### 3. Enable Socket Mode
@@ -85,6 +95,7 @@ Go to **Slash Commands** and create:
 1. Go to **Install App**
 2. Click **Install to Workspace**
 3. Copy the **Bot User OAuth Token** as `SLACK_BOT_TOKEN`
+4. If you added user token scopes, also copy the **User OAuth Token** as `SLACK_USER_TOKEN`
 
 ### 7. Configure Environment
 
@@ -99,8 +110,8 @@ SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 CLAUDE_WORKING_DIR=/path/to/your/project
 
-# Optional: custom database location (default: ~/.slack_code/conversations.db)
-SLACK_CONV_DB=/path/to/conversations.db
+# Optional: enable cross-channel Slack search
+# SLACK_USER_TOKEN=xoxp-your-user-token
 ```
 
 ### 8. Install Dependencies & Run
@@ -126,6 +137,14 @@ Attach an image and ask Claude to analyze it.
 ### Create Files
 Ask Claude to create a file and it will be uploaded to the chat.
 
+### Cross-Channel Search
+Ask Claude to find or read messages from other channels:
+```
+@Claude Code search for discussions about authentication in #engineering
+@Claude Code what was the last message in #general?
+```
+Requires `SLACK_USER_TOKEN` to be configured.
+
 ### Slash Command
 ```
 /claude explain this error: TypeError: 'NoneType' object is not subscriptable
@@ -139,14 +158,16 @@ Ask Claude to create a file and it will be uploaded to the chat.
 ### Delete Bot Messages
 React with :x: on any bot message to delete it.
 
-## Conversation History
+## How Sessions Work
 
-Conversations are persisted in a SQLite database (`conversations.db`):
+Each conversation thread gets its own `ClaudeSDKClient` instance:
 
-- History survives bot restarts
-- Last 10 messages loaded for context
-- Use `/claude-reset` to clear history
-- Old conversations (30+ days) can be cleaned up
+- **While running** — the client maintains full conversation context natively across messages
+- **After restart** — a new client is created and Slack thread history is fetched via the API to restore context
+- **Idle cleanup** — clients idle for 30+ minutes are automatically disconnected
+- **No database** — Slack is the single source of truth for conversation history
+
+Use `/claude-reset` to disconnect the client and start fresh.
 
 ## Security Considerations
 
@@ -158,6 +179,11 @@ By default, the bot enables these tools:
 - `Grep` - Search file contents
 - `WebSearch` - Search the web
 - `WebFetch` - Fetch web pages
+
+When `SLACK_USER_TOKEN` is set, these additional tools are available:
+- `search_slack` - Search messages across all public channels
+- `read_channel_messages` - Read recent messages from a channel
+- `list_channels` - List public channels
 
 To use read-only mode, modify `claude_handler.py`:
 
@@ -177,16 +203,6 @@ self.allowed_tools = [
 
 Set `CLAUDE_WORKING_DIR` in `.env` to the directory you want Claude to operate in.
 
-### Database Location
-
-Set the `SLACK_CONV_DB` environment variable:
-
-```bash
-export SLACK_CONV_DB=/path/to/conversations.db
-```
-
-Default location: `~/.slack_code/conversations.db`
-
 ### Adjust Response Length
 
 Modify the truncation limit in `claude_handler.py`:
@@ -201,15 +217,19 @@ if len(response) > 3900:  # Change this value
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────────┐
 │   Slack     │────▶│   bot.py    │────▶│ claude_handler  │
-│  Workspace  │◀────│ (Bolt App)  │◀────│   (SDK Client)  │
-└─────────────┘     └─────────────┘     └─────────────────┘
-                                               │
-                                               ▼
-                                        ┌─────────────────┐
-                                        │ conversation_db │
-                                        │    (SQLite)     │
-                                        └─────────────────┘
+│  Workspace  │◀────│ (Bolt App)  │◀────│ (SDKClient)     │
+└─────────────┘     └──────┬──────┘     └────────┬────────┘
+                           │                     │
+                    ┌──────┴──────┐       ┌──────┴────────┐
+                    │  Persistent │       │  Slack Tools  │
+                    │  Event Loop │       │ (user token)  │
+                    │  (threading)│       │  search/read  │
+                    └─────────────┘       └───────────────┘
 ```
+
+- **bot.py** — Slack Bolt event handlers run synchronously; a persistent background event loop bridges them to async `ClaudeSDKClient` calls
+- **claude_handler.py** — manages one `ClaudeSDKClient` per conversation thread, with per-conversation locks, idle cleanup, and optional Slack search tools
+- **Slack Tools** — registered as in-process function tools via the SDK; Claude invokes them autonomously when users ask about other channels
 
 ## Troubleshooting
 
@@ -219,6 +239,7 @@ Install the CLI: `curl -fsSL https://claude.ai/install.sh | bash`
 ### "Invalid token" errors
 - Verify `SLACK_BOT_TOKEN` starts with `xoxb-`
 - Verify `SLACK_APP_TOKEN` starts with `xapp-`
+- Verify `SLACK_USER_TOKEN` starts with `xoxp-` (if using cross-channel search)
 - Reinstall the app if tokens were regenerated
 
 ### Bot doesn't respond to DMs
@@ -236,3 +257,8 @@ Install the CLI: `curl -fsSL https://claude.ai/install.sh | bash`
 ### Images not being processed
 - Verify `files:read` scope is added
 - Check that the bot can download files from Slack
+
+### Cross-channel search not working
+- Verify `SLACK_USER_TOKEN` is set in `.env`
+- Verify `search:read` user token scope is added
+- Reinstall the app after adding new scopes
